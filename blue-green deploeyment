@@ -1,0 +1,68 @@
+import boto3
+import time
+
+asg = boto3.client('autoscaling')
+elbv2 = boto3.client('elbv2')
+
+def lambda_handler(event, context):
+    green_asg_name = 'ASG-myapp-green'
+    blue_asg_name = 'ASG-myapp-blue-lt'
+    load_balancer_arn = 'arn:aws:elasticloadbalancing:us-east-1:195068149265:loadbalancer/app/zero-downtime/daf21a419772ca46'
+    green_target_group_arn = 'arn:aws:elasticloadbalancing:us-east-1:195068149265:targetgroup/my-tg-green/a614e2fe8fd30966'
+    blue_target_group_arn = 'arn:aws:elasticloadbalancing:us-east-1:195068149265:targetgroup/myapp-tg-blue/f745d52fe6b5ef19'
+
+    try:
+        print(f"Received event: {event}")
+
+        # 1. Increase the desired capacity of the green ASG to match the blue ASG
+        blue_asg_response = asg.describe_auto_scaling_groups(AutoScalingGroupNames=[blue_asg_name])
+        if not blue_asg_response['AutoScalingGroups']:
+            print(f"Error: Auto Scaling Group '{blue_asg_name}' not found.")
+            return
+        current_blue_desired = blue_asg_response['AutoScalingGroups'][0]['DesiredCapacity']
+        print(f"Setting desired capacity of '{green_asg_name}' to {current_blue_desired}")
+        asg.update_auto_scaling_group(
+            AutoScalingGroupName=green_asg_name,
+            DesiredCapacity=current_blue_desired
+        )
+
+        # 2. Wait for instances in the green ASG to become healthy in the ALB
+        print(f"Waiting for instances in '{green_asg_name}' to become healthy in ALB target group...")
+        waiter = elbv2.get_waiter('target_in_service')
+        waiter.wait(
+            TargetGroupArn=green_target_group_arn,
+            Targets=[{'Id': i['InstanceId'], 'Port': 80} for i in asg.describe_auto_scaling_groups(AutoScalingGroupNames=[green_asg_name])['AutoScalingGroups'][0]['Instances']],
+            WaiterConfig={'Delay': 15, 'MaxAttempts': 20}  # Adjust as needed
+        )
+        print(f"Instances in '{green_asg_name}' are now healthy in the ALB.")
+
+        # 3. Update the ALB listener to direct traffic only to the green target group
+        print(f"Updating ALB listener to direct traffic to '{green_target_group_arn}'")
+        alb_response = elbv2.describe_listeners(LoadBalancerArns=[load_balancer_arn])
+        if alb_response['Listeners']:
+            listener_arn = alb_response['Listeners'][0]['ListenerArn']  # Assuming only one listener
+            elbv2.modify_listener(
+                ListenerArn=listener_arn,
+                DefaultActions=[
+                    {
+                        'Type': 'forward',
+                        'TargetGroupArn': green_target_group_arn
+                    }
+                ]
+            )
+            print("ALB listener updated to green target group.")
+        else:
+            print("Error: No listeners found for the specified ALB.")
+            return
+
+        # 4. Scale down the blue ASG
+        print(f"Setting desired capacity of '{blue_asg_name}' to 0")
+        asg.update_auto_scaling_group(
+            AutoScalingGroupName=blue_asg_name,
+            DesiredCapacity=0
+        )
+        print(f"Scaled down '{blue_asg_name}'.")
+
+    except Exception as e:
+        print(f"Error during scale-up: {e}")
+        # Consider adding more robust error handling
